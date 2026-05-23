@@ -45,12 +45,19 @@ jobs:
       # Restore-key falls back to the latest deps build on this OS so
       # incremental work on src/** does not re-pay the 50-minute cost.
       # ---------------------------------------------------------------
+      # NOTE on the cache key: we deliberately hash only the small,
+      # static set of files that describe what gets built (the per-dep
+      # *.cmake recipes, the top-level CMakeLists, BuildLinux.sh, and the
+      # apt manifest). An earlier version used `deps/**` which timed out
+      # the post-step `hashFiles` (>120 s) because the cache save runs
+      # AFTER the build has populated `deps/build/destdir/` with
+      # hundreds of thousands of files.
       - name: Cache deps destdir
         id: deps-cache
         uses: actions/cache@v4
         with:
           path: deps/build/destdir
-          key: bambu-deps-ubuntu-22.04-${{ hashFiles('deps/**', 'BuildLinux.sh', 'linux.d/**') }}
+          key: bambu-deps-ubuntu-22.04-${{ hashFiles('deps/**/*.cmake', 'deps/CMakeLists.txt', 'BuildLinux.sh', 'linux.d/**') }}
           restore-keys: |
             bambu-deps-ubuntu-22.04-
 
