@@ -138,14 +138,25 @@ jobs:
                 vertical-cloud-lab/tensegrity-optimization 65d0d3f \
                 cad/t3-prism/slices/t3-prism.H2D-MM-PLAstruts-TPUcables.3mf
           # The batch 3MF lives on PR #35's head ref; resolve it lazily.
-          if pr_head=$(gh api /repos/vertical-cloud-lab/tensegrity-optimization/pulls/35 --jq .head.sha 2>/dev/null); then
+          # Note: tensegrity-optimization is public, so GITHUB_TOKEN can read
+          # it cross-repo (same as the single-specimen fetch above).
+          if pr_head=$(gh api /repos/vertical-cloud-lab/tensegrity-optimization/pulls/35 --jq .head.sha); then
+            echo "PR #35 head: ${pr_head}"
+            # Match either token ordering: the actual filename in the tree is
+            # bo/slices/t3-prism-bo-batch.H2D-MM-PLAstruts-TPUcables.3mf
+            # (i.e. "batch" appears BEFORE "H2D-MM-PLAstruts-TPUcables").
             batch_path=$(gh api "/repos/vertical-cloud-lab/tensegrity-optimization/git/trees/${pr_head}?recursive=1" \
-                          --jq '.tree[] | select(.path|test("H2D-MM-PLAstruts-TPUcables.*batch.*\\.3mf$")) | .path' \
+                          --jq '.tree[] | select(.path|test("batch.*H2D-MM-PLAstruts-TPUcables.*\\.3mf$") or test("H2D-MM-PLAstruts-TPUcables.*batch.*\\.3mf$")) | .path' \
                           | head -n1)
+            echo "Resolved batch path: ${batch_path:-<none>}"
             if [ -n "${batch_path}" ]; then
               fetch "${STAGE}/3mf/t3-prism.H2D-MM-PLAstruts-TPUcables.batch.3mf" \
                     vertical-cloud-lab/tensegrity-optimization "${pr_head}" "${batch_path}"
+            else
+              echo "WARN: no batch 3MF matched the regex in PR #35 tree" >&2
             fi
+          else
+            echo "WARN: could not resolve PR #35 head sha" >&2
           fi
 
           # README so the next session knows what's what.
