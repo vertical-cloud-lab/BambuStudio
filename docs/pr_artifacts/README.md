@@ -13,6 +13,10 @@ sha `b437953`) on Ubuntu 22.04.
 - `single_specimen.xy.png` / `single_specimen.iso.png` — single specimen
   (input: `t3-prism.H2D-MM-PLAstruts-TPUcables.single.3mf`, ~46 MB G-code,
   17,666 PLA segments + 16,018 TPU segments).
+- `t3-prism.H2D-MM-PLAstruts-TPUcables.single.gcode.3mf` — sliced
+  G-code-3MF for the single specimen (importable into Bambu Studio via
+  *File → Import → Import sliced file*). Contains `Metadata/plate_1.gcode`
+  produced by the patched CLI on this branch.
 - `batch.xy.png` / `batch.iso.png` — batch (input:
   `t3-prism.H2D-MM-PLAstruts-TPUcables.batch.3mf`, ~59 MB G-code, 14,491 PLA
   segments + 20,906 TPU segments).
