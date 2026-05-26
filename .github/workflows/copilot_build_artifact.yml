@@ -1,0 +1,208 @@
+name: Copilot Build Artifact (Ubuntu)
+
+# Build deps + slicer once on a hosted runner and upload the products as
+# Actions artifacts so that subsequent Copilot agent sessions (which start
+# from a clean disk) can `gh run download` them instead of rebuilding.
+#
+# See plan in PR thread: deps ~50 min + slicer ~30-40 min, well under the
+# 6 h job limit.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'copilot/**'
+
+concurrency:
+  group: copilot-build-artifact-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build deps + slicer (ubuntu-22.04)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 330  # 5h30, under the 6h hard limit
+    env:
+      DEPS_TARBALL: BambuStudio_deps_ubuntu-22.04.tar.gz
+      SLICER_TARBALL: BambuStudio_slicer_ubuntu-22.04.tar.gz
+      INPUTS_TARBALL: slice-inputs.tar.gz
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: 'true'
+
+      - name: Free disk space
+        run: |
+          df -h
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          sudo docker image prune --all --force || true
+          df -h
+
+      # ---------------------------------------------------------------
+      # Deps: cache the built destdir keyed on inputs that affect it.
+      # Restore-key falls back to the latest deps build on this OS so
+      # incremental work on src/** does not re-pay the 50-minute cost.
+      # ---------------------------------------------------------------
+      # NOTE on the cache key: we deliberately hash only the small,
+      # static set of files that describe what gets built (the per-dep
+      # *.cmake recipes, the top-level CMakeLists, BuildLinux.sh, and the
+      # apt manifest). An earlier version used `deps/**` which timed out
+      # the post-step `hashFiles` (>120 s) because the cache save runs
+      # AFTER the build has populated `deps/build/destdir/` with
+      # hundreds of thousands of files.
+      - name: Cache deps destdir
+        id: deps-cache
+        uses: actions/cache@v4
+        with:
+          path: deps/build/destdir
+          key: bambu-deps-ubuntu-22.04-${{ hashFiles('deps/**/*.cmake', 'deps/CMakeLists.txt', 'BuildLinux.sh', 'linux.d/**') }}
+          restore-keys: |
+            bambu-deps-ubuntu-22.04-
+
+      - name: Install build tools (system update)
+        run: sudo ./BuildLinux.sh -ur
+
+      - name: Build deps (skipped on cache hit)
+        if: steps.deps-cache.outputs.cache-hit != 'true'
+        run: |
+          sudo chown -R "$USER" .
+          ./BuildLinux.sh -dr
+
+      - name: Build BambuStudio slicer
+        run: |
+          sudo chown -R "$USER" .
+          ./BuildLinux.sh -sr
+
+      # ---------------------------------------------------------------
+      # Package artifacts
+      # ---------------------------------------------------------------
+      - name: Package deps tarball
+        run: |
+          cd deps/build
+          tar -czf "${GITHUB_WORKSPACE}/${DEPS_TARBALL}" destdir
+          ls -lh "${GITHUB_WORKSPACE}/${DEPS_TARBALL}"
+
+      - name: Package slicer tarball
+        run: |
+          # The CLI binary needs the `resources/` tree alongside it.
+          # Match the upstream package_resources.sh layout: bin + resources
+          # rooted at a single top-level dir.
+          STAGE="$(mktemp -d)/BambuStudio"
+          mkdir -p "${STAGE}/bin"
+          # Binary name can be either bambu-studio or BambuStudio depending
+          # on cmake target naming; copy whichever exists.
+          for bin in build/src/bambu-studio build/src/BambuStudio; do
+            if [ -f "${bin}" ]; then cp "${bin}" "${STAGE}/bin/"; fi
+          done
+          # resources/ at repo root is what the runtime expects to find
+          # next to the binary (see slic3r/Utils/resources_dir()).
+          cp -a resources "${STAGE}/resources"
+          tar -C "$(dirname "${STAGE}")" -czf "${GITHUB_WORKSPACE}/${SLICER_TARBALL}" BambuStudio
+          ls -lh "${GITHUB_WORKSPACE}/${SLICER_TARBALL}"
+
+      # ---------------------------------------------------------------
+      # Inputs bundle: collect the 3MFs and resolved profile JSONs the
+      # next agent session needs to drive the CLI, so it does not have
+      # to go hunting through other repos.
+      # ---------------------------------------------------------------
+      - name: Package slice inputs bundle
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          STAGE="$(mktemp -d)/slice-inputs"
+          mkdir -p "${STAGE}/3mf" "${STAGE}/profiles/machine" "${STAGE}/profiles/process" "${STAGE}/profiles/filament"
+
+          # Copy the resolved H2D profile JSONs out of the repo.
+          cp "resources/profiles/BBL/machine/Bambu Lab H2D 0.4 nozzle.json"               "${STAGE}/profiles/machine/" || true
+          cp "resources/profiles/BBL/process/0.20mm Standard @BBL H2D.json"               "${STAGE}/profiles/process/" || true
+          cp "resources/profiles/BBL/filament/Bambu PLA Basic @BBL H2D.json"              "${STAGE}/profiles/filament/" || true
+          cp "resources/profiles/BBL/filament/Bambu TPU 85A @BBL H2D 0.4 nozzle.json"     "${STAGE}/profiles/filament/" || true
+
+          # Fetch the two failing 3MFs from the sibling repo. Use the
+          # GITHUB_TOKEN; if that lacks cross-repo read, the step keeps
+          # going so the rest of the artifact is still useful.
+          fetch() {
+            local dst="$1" repo="$2" ref="$3" path="$4"
+            echo "Fetching ${repo}@${ref}:${path}"
+            if ! gh api -H "Accept: application/vnd.github.raw" \
+                "/repos/${repo}/contents/${path}?ref=${ref}" \
+                > "${dst}"; then
+              echo "WARN: could not fetch ${repo}:${path}; continuing" >&2
+              rm -f "${dst}"
+            fi
+          }
+          fetch "${STAGE}/3mf/t3-prism.H2D-MM-PLAstruts-TPUcables.single.3mf" \
+                vertical-cloud-lab/tensegrity-optimization 65d0d3f \
+                cad/t3-prism/slices/t3-prism.H2D-MM-PLAstruts-TPUcables.3mf
+          # The batch 3MF lives on PR #35's head ref; resolve it lazily.
+          # Note: tensegrity-optimization is public, so GITHUB_TOKEN can read
+          # it cross-repo (same as the single-specimen fetch above).
+          if pr_head=$(gh api /repos/vertical-cloud-lab/tensegrity-optimization/pulls/35 --jq .head.sha); then
+            echo "PR #35 head: ${pr_head}"
+            # Match either token ordering: the actual filename in the tree is
+            # bo/slices/t3-prism-bo-batch.H2D-MM-PLAstruts-TPUcables.3mf
+            # (i.e. "batch" appears BEFORE "H2D-MM-PLAstruts-TPUcables").
+            batch_path=$(gh api "/repos/vertical-cloud-lab/tensegrity-optimization/git/trees/${pr_head}?recursive=1" \
+                          --jq '.tree[] | select(.path|test("batch.*H2D-MM-PLAstruts-TPUcables.*\\.3mf$") or test("H2D-MM-PLAstruts-TPUcables.*batch.*\\.3mf$")) | .path' \
+                          | head -n1)
+            echo "Resolved batch path: ${batch_path:-<none>}"
+            if [ -n "${batch_path}" ]; then
+              fetch "${STAGE}/3mf/t3-prism.H2D-MM-PLAstruts-TPUcables.batch.3mf" \
+                    vertical-cloud-lab/tensegrity-optimization "${pr_head}" "${batch_path}"
+            else
+              echo "WARN: no batch 3MF matched the regex in PR #35 tree" >&2
+            fi
+          else
+            echo "WARN: could not resolve PR #35 head sha" >&2
+          fi
+
+          # README so the next session knows what's what.
+          cat > "${STAGE}/README.md" <<'EOF'
+          slice-inputs bundle
+          ===================
+          3mf/                  failing inputs from tensegrity-optimization
+          profiles/machine/     Bambu Lab H2D 0.4 nozzle.json
+          profiles/process/     0.20mm Standard @BBL H2D.json
+          profiles/filament/    Bambu PLA Basic @BBL H2D.json
+                                Bambu TPU 85A @BBL H2D 0.4 nozzle.json
+
+          Drive the CLI with:
+            bambu-studio --slice 0 \
+              --load-settings "machine.json;process.json" \
+              --load-filaments "PLA.json;TPU.json" \
+              --filament-map-mode manual --filament-map 1 2 \
+              --outputdir out  3mf/<input>.3mf
+          EOF
+
+          tar -C "$(dirname "${STAGE}")" -czf "${GITHUB_WORKSPACE}/${INPUTS_TARBALL}" slice-inputs
+          ls -lh "${GITHUB_WORKSPACE}/${INPUTS_TARBALL}"
+
+      # ---------------------------------------------------------------
+      # Uploads
+      # ---------------------------------------------------------------
+      - name: Upload deps artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bambu-studio-deps-ubuntu-22.04-${{ github.sha }}
+          path: ${{ env.DEPS_TARBALL }}
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Upload slicer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bambu-studio-bin-ubuntu-22.04
+          path: ${{ env.SLICER_TARBALL }}
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Upload slice-inputs artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: slice-inputs
+          path: ${{ env.INPUTS_TARBALL }}
+          retention-days: 14
+          if-no-files-found: warn
